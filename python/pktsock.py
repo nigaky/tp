@@ -1,6 +1,14 @@
 #!/usr/bin/env python
+#
+# pktsock -- TCP socket implemented by using scapy
+#
 
 from scapy.all import *
+import os
+from select import select
+import cPickle
+import signal
+from threading import Thread, Event
 
 class SessionError(Exception):
     pass
@@ -8,25 +16,62 @@ class SessionError(Exception):
 class TCPPacketSock(object):
     MTU = 1500
 
-    def __init__(self):
-        self.psock = conf.L3socket()
-
+    def __init__(self, iface = None):
+        # IP stuff
         self.dst = None
-        self.dport = None
         self.src = None
-        self.sport = None
 
         # TCP stuff
+        self.dport = None
+        self.sport = None
         self.acked = 0
         self.rseq = 0
         self.seq = 0
         self.ack = 0
 
+        # worker
+        self.psock = conf.L3socket(iface = iface)
+        self.iface = iface
+        self.sendpkt_buf = []
+        self.recvpkt_buf = []
+        self.worker = None
+
     def __del__(self):
         if self.dst is not None:
             # remove filtering rule added on rbind()
             os.popen('iptables -D OUTPUT -p tcp --tcp-flags RST RST -d %s --dport %d -j DROP' %\
-                     (self.dst, self.dport)) 
+                     (self.dst, self.dport))
+        if self.worker and self.worker.isAlive():
+            # kill sendrecv worker
+            self.worker_ev.set()
+
+    def sig_handler(self, signum, frame):
+        print self.worker_ev, 'set'
+        self.worker_ev.set()
+
+    def init_sock_worker(self):
+        """Initialize a worker to send/recv on another process
+        """
+
+        self.worker_ev = Event()
+        signal.signal(signal.SIGTERM, self.sig_handler)
+        signal.signal(signal.SIGINT, self.sig_handler)
+        self.worker = Thread(target = self.sendrecv_work, args = (self.worker_ev, ))
+        self.worker.start()
+
+    def sendrecv_work(self, ev):
+        while not ev.isSet():
+            inp, outp, err = select([self.psock], [], [], 1)
+            # if self.sendpkt_buf in inp:
+            #     # sendbuf has a packet
+            #     print 'send_pipe', self.sendpkt_buf.pop(0)
+            if ev.isSet():
+                break
+            if self.psock in inp:
+                # packet recieved
+                p = self._recv_pkt(1)
+                if p:
+                    print 'recv', repr(p)
 
     # socket method
     def bind(self, addr):
@@ -36,6 +81,8 @@ class TCPPacketSock(object):
         self.src =addr[0]
         self.sport = addr[1]
 
+        # initialize worker here
+        self.init_sock_worker()
 
     def connect(self, addr = None):
         """Connect to remote socket
@@ -90,19 +137,22 @@ class TCPPacketSock(object):
         pkt.seq = self.seq
         pkt.ack = self.rseq
 
+    def _send_pkt(self, pkt):
+        # self.psock.send(pkt)
+        self.psock.send(pkt)
+
     def send_pkt(self, pkt):
         if not TCP in pkt:
             raise ValueError, 'packet does not have TCP layer'
 
         self.set_ip_param(pkt)
         self.set_tcp_param(pkt)
-        self.psock.send(pkt)
+        self._send_pkt(pkt)
         self.seq += len(pkt[TCP].payload)
 
         # SYN or FIN packet -> seq++
         if pkt[TCP].flags & (1<<1) or pkt[TCP].flags & (1<<0):
             self.seq += 1
-
 
     def send_syn(self):
         self.send_pkt(IP()/TCP(flags='S'))
@@ -129,13 +179,14 @@ class TCPPacketSock(object):
             self.rseq += 1
 
     def _recv_pkt(self, num):
-        while True:
-            p = self.psock.recv(self.MTU)
-            if p is  None or TCP not in p:
-                continue
-            if p.dst == self.src and p.dport == self.sport:
-                self._handle_recv_pkt(p)
-                return p
+        p = self.psock.recv(self.MTU)
+        if p is  None or TCP not in p:
+            return None
+        if p.dst == self.src and p.dport == self.sport:
+            self._handle_recv_pkt(p)
+            return p
+        return None
+
     def recv_pkt(self, num = 1):
         return self._recv_pkt(num)
 
@@ -144,9 +195,14 @@ def main():
     s.bind(('192.168.11.76', 9000))
     s.rbind(('192.168.11.1', 8000))
 
-    s.connect()
-    s.send('abcde')
-    s.close()
+    s.send_syn()
+    s.send_ack()
+    s.send_rst()
+    raw_input()
+    # s.connect()
+    # s.send('abcde')
+    # s.close()
+    s.worker_ev.set()
 
 if __name__ == "__main__":
     main()
